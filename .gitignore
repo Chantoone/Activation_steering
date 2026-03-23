@@ -1,0 +1,22 @@
+# Byte-compiled / interpreter artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Notebooks and tooling
+.ipynb_checkpoints/
+.DS_Store
+
+# Packaging / build
+*.egg-info/
+build/
+dist/
+
+# Caches and helpers
+.cache/
+helper/
