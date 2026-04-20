@@ -205,6 +205,33 @@ def render_chat_prompt(
     )
 
 
+def _resolve_multipivot_prompts_from_row(
+    row: Dict[str, Any],
+    target_text: str,
+) -> Optional[Dict[str, str]]:
+    raw_prompt = _clean_text(row.get("prompt"))
+    raw_prefix_prompt = _clean_text(row.get("prefix_prompt"))
+
+    if not raw_prompt and not raw_prefix_prompt:
+        return None
+
+    if raw_prefix_prompt:
+        prefix_prompt = raw_prefix_prompt
+        full_prompt = raw_prompt if raw_prompt else f"{prefix_prompt}{target_text}"
+    else:
+        if target_text and raw_prompt.endswith(target_text):
+            full_prompt = raw_prompt
+            prefix_prompt = raw_prompt[: len(raw_prompt) - len(target_text)]
+        else:
+            prefix_prompt = raw_prompt
+            full_prompt = f"{raw_prompt}{target_text}"
+
+    return {
+        "prefix_prompt": prefix_prompt,
+        "prompt": full_prompt,
+    }
+
+
 def build_prompt_record(
     row: Dict[str, Any],
     prompt_type: str,
@@ -251,7 +278,18 @@ def build_prompt_record(
         if column in row:
             record[column] = row.get(column)
 
-    if tokenizer is not None:
+    use_raw_multipivot_prompt = prompt_type.lower() == "multipivot"
+    resolved_raw_prompts = None
+    if use_raw_multipivot_prompt:
+        resolved_raw_prompts = _resolve_multipivot_prompts_from_row(
+            row=row,
+            target_text=target_text,
+        )
+
+    if resolved_raw_prompts is not None:
+        record["prefix_prompt"] = resolved_raw_prompts["prefix_prompt"]
+        record["prompt"] = resolved_raw_prompts["prompt"]
+    elif tokenizer is not None:
         record["prefix_prompt"] = render_chat_prompt(
             tokenizer,
             prefix_messages,

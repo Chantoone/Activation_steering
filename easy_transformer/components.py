@@ -315,7 +315,7 @@ class Attention(nn.Module):
         if self.cfg.scale_attn_by_inverse_layer_idx:
             self.attn_scale *= self.layer_id + 1
 
-        if self.cfg.model_family == 'llama':
+        if self.cfg.model_family in {"llama", "qwen2"}:
             self.ln1 = RMSNormPre(cfg)
         else:
             self.ln1 = LayerNormPre(cfg)  # moved here by Arthur
@@ -351,7 +351,7 @@ class Attention(nn.Module):
             )
             self.register_buffer("rotary_sin", sin)
             self.register_buffer("rotary_cos", cos)
-            if self.cfg.model_family == 'llama':
+            if self.cfg.model_family in {"llama", "qwen2"}:
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.cfg.d_head,
                     max_position_embeddings=self.cfg.n_ctx,
@@ -449,7 +449,7 @@ class Attention(nn.Module):
         kv_cache_pos_offset = 0
 
         if self.cfg.positional_embedding_type == "rotary":
-            if self.cfg.model_family == 'llama' or self.cfg.model_family == 'mistral':
+            if self.cfg.model_family in {"llama", "mistral", "qwen2"}:
                 # Only transpose once, minimizing redundant transpositions
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                 kv_seq_len = k.shape[-2]
@@ -794,7 +794,7 @@ class TransformerBlock(nn.Module):
             # We've folded in LayerNorm weights, so just need the center + scale parts
             warnings.warn("Moved LN1 to the attention block")
             if not self.cfg.attn_only:
-                if self.cfg.model_family == "llama":
+                if self.cfg.model_family in {"llama", "qwen2"}:
                     self.ln2 = RMSNormPre(cfg)
                 else:
                     self.ln2 = LayerNormPre(cfg)
@@ -814,7 +814,9 @@ class TransformerBlock(nn.Module):
             attn_type = self.cfg.attn_types[block_index]
             self.attn = Attention(cfg, attn_type, block_index)
         if not self.cfg.attn_only:
-            if "llama" in self.cfg.model_family:
+            if self.cfg.model_family in {"llama", "qwen2"} or (
+                isinstance(self.cfg.model_family, str) and "llama" in self.cfg.model_family
+            ):
                 self.mlp = LlamaMLP(cfg)
             else:
                 self.mlp = MLP(cfg)

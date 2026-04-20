@@ -423,6 +423,76 @@ def convert_llama_weights(llama, cfg: EasyTransformerConfig):
 
     return state_dict
 
+
+def convert_qwen2_weights(qwen2, cfg: EasyTransformerConfig):
+    state_dict = {}
+
+    state_dict["embed.W_E"] = qwen2.model.embed_tokens.weight
+
+    for l in range(cfg.n_layers):
+        layer = qwen2.model.layers[l]
+        state_dict[f"blocks.{l}.ln1.w"] = layer.input_layernorm.weight
+
+        W_Q = layer.self_attn.q_proj.weight
+        W_K = layer.self_attn.k_proj.weight
+        W_V = layer.self_attn.v_proj.weight
+
+        state_dict[f"blocks.{l}.attn.W_Q"] = einops.rearrange(
+            W_Q, "(i h) m -> i m h", i=cfg.n_heads
+        )
+        state_dict[f"blocks.{l}.attn.W_K"] = einops.rearrange(
+            W_K, "(i h) m -> i m h", i=cfg.n_key_value_heads
+        )
+        state_dict[f"blocks.{l}.attn.W_V"] = einops.rearrange(
+            W_V, "(i h) m -> i m h", i=cfg.n_key_value_heads
+        )
+
+        b_Q = getattr(layer.self_attn.q_proj, "bias", None)
+        b_K = getattr(layer.self_attn.k_proj, "bias", None)
+        b_V = getattr(layer.self_attn.v_proj, "bias", None)
+        state_dict[f"blocks.{l}.attn.b_Q"] = (
+            einops.rearrange(b_Q, "(i h) -> i h", i=cfg.n_heads)
+            if b_Q is not None
+            else torch.zeros(cfg.n_heads, cfg.d_head)
+        )
+        state_dict[f"blocks.{l}.attn.b_K"] = (
+            einops.rearrange(b_K, "(i h) -> i h", i=cfg.n_key_value_heads)
+            if b_K is not None
+            else torch.zeros(cfg.n_key_value_heads, cfg.d_head)
+        )
+        state_dict[f"blocks.{l}.attn.b_V"] = (
+            einops.rearrange(b_V, "(i h) -> i h", i=cfg.n_key_value_heads)
+            if b_V is not None
+            else torch.zeros(cfg.n_key_value_heads, cfg.d_head)
+        )
+
+        W_O = layer.self_attn.o_proj.weight
+        state_dict[f"blocks.{l}.attn.W_O"] = einops.rearrange(
+            W_O, "m (i h) -> i h m", i=cfg.n_heads
+        )
+        b_O = getattr(layer.self_attn.o_proj, "bias", None)
+        state_dict[f"blocks.{l}.attn.b_O"] = (
+            b_O if b_O is not None else torch.zeros(cfg.d_model)
+        )
+
+        state_dict[f"blocks.{l}.ln2.w"] = layer.post_attention_layernorm.weight
+
+        state_dict[f"blocks.{l}.mlp.W_gate"] = layer.mlp.gate_proj.weight.T
+        state_dict[f"blocks.{l}.mlp.b_gate"] = torch.zeros(cfg.d_mlp)
+        state_dict[f"blocks.{l}.mlp.W_up"] = layer.mlp.up_proj.weight.T
+        state_dict[f"blocks.{l}.mlp.b_up"] = torch.zeros(cfg.d_mlp)
+        state_dict[f"blocks.{l}.mlp.W_down"] = layer.mlp.down_proj.weight.T
+        state_dict[f"blocks.{l}.mlp.b_down"] = torch.zeros(cfg.d_model)
+
+    state_dict["ln_final.w"] = qwen2.model.norm.weight
+    state_dict["unembed.W_U"] = qwen2.lm_head.weight.T
+    lm_head_bias = getattr(qwen2.lm_head, "bias", None)
+    state_dict["unembed.b_U"] = (
+        lm_head_bias if lm_head_bias is not None else torch.zeros(cfg.d_vocab)
+    )
+
+    return state_dict
+
 def convert_mistral_weights(llama, cfg: EasyTransformerConfig):
     state_dict = {}
 

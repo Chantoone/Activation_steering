@@ -402,9 +402,6 @@ class EasyTransformer(HookedRootModule):
             hf_model_name = cls.PRETRAINED_MODEL_NAMES_DICT[model_name]
         else:
             hf_model_name = model_name
-        # The model family (eg "gpt2" or "neo")
-        model_family = cls.get_model_family(hf_model_name)
-
         if hf_model is None:
             if checkpoint is not None:
                 if "stanford" not in model_name:
@@ -421,6 +418,12 @@ class EasyTransformer(HookedRootModule):
                     )
             else:
                 hf_model = AutoModelForCausalLM.from_pretrained(hf_model_name, device_map="cpu")
+
+        # The model family (eg "gpt2" or "neo")
+        model_family = cls.get_model_family(hf_model_name)
+        hf_model_type = getattr(hf_model.config, "model_type", None)
+        if hf_model_type in {"qwen2", "qwen2_moe"}:
+            model_family = "qwen2"
 
         cfg = cls.convert_hf_config(hf_model.config, model_family=model_family)
         if device is not None:
@@ -442,6 +445,8 @@ class EasyTransformer(HookedRootModule):
             state_dict = weight_conversion.convert_gpt2_weights(hf_model, model.cfg)
         elif model_family == "llama":
             state_dict = weight_conversion.convert_llama_weights(hf_model, model.cfg)
+        elif model_family == "qwen2":
+            state_dict = weight_conversion.convert_qwen2_weights(hf_model, model.cfg)
         elif model_family == "mistral":
             state_dict = weight_conversion.convert_mistral_weights(hf_model, model.cfg)
         # elif model_family == "mistral":
@@ -658,6 +663,8 @@ class EasyTransformer(HookedRootModule):
             return "neo"
         elif "llama" in model_name.lower() or "alma" in model_name.lower():
             return "llama"
+        elif "qwen2.5" in model_name.lower() or "qwen2" in model_name.lower():
+            return "qwen2"
         elif "mistral" in model_name.lower():
             return "llama"
         else:
@@ -717,6 +724,33 @@ class EasyTransformer(HookedRootModule):
                 "use_attn_scale": True,                    # Whether to scale attention
                 "use_local_attn": False,                   # Whether to use local attention (LLaMA does not use this by default)
                 "scale_attn_by_inverse_layer_idx": False,  # Attention scaling by inverse layer index (GPT-2 style)
+                "rope_theta": getattr(hf_config, "rope_theta", 10000.0),
+            }
+        elif model_family == "qwen2":
+            rope_theta = getattr(hf_config, "rope_theta", None)
+            if rope_theta is None:
+                rope_parameters = getattr(hf_config, "rope_parameters", None)
+                if isinstance(rope_parameters, dict):
+                    rope_theta = rope_parameters.get("rope_theta")
+            cfg_dict = {
+                "d_model": hf_config.hidden_size,
+                "d_head": hf_config.hidden_size // hf_config.num_attention_heads,
+                "n_heads": hf_config.num_attention_heads,
+                "n_key_value_heads": hf_config.num_key_value_heads,
+                "d_mlp": hf_config.intermediate_size,
+                "n_layers": hf_config.num_hidden_layers,
+                "n_ctx": hf_config.max_position_embeddings,
+                "eps": hf_config.rms_norm_eps,
+                "d_vocab": hf_config.vocab_size,
+                "positional_embedding_type": "rotary",
+                "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
+                "final_rms": True,
+                "initializer_range": hf_config.initializer_range,
+                "act_fn": hf_config.hidden_act,
+                "use_attn_scale": True,
+                "use_local_attn": False,
+                "scale_attn_by_inverse_layer_idx": False,
+                "rope_theta": rope_theta if rope_theta is not None else 1000000.0,
             }
         elif model_family == "mistral":
             cfg_dict = {
@@ -737,6 +771,7 @@ class EasyTransformer(HookedRootModule):
                 "use_attn_scale": True,                    # Whether to scale attention
                 "use_local_attn": False,                   # Whether to use local attention (LLaMA does not use this by default)
                 "scale_attn_by_inverse_layer_idx": False,  # Attention scaling by inverse layer index (GPT-2 style)
+                "rope_theta": getattr(hf_config, "rope_theta", 10000.0),
             }
         # elif model_family == "mistral":
         #     cfg_dict = {
@@ -939,7 +974,7 @@ class EasyTransformer(HookedRootModule):
 
             # Fold ln2 into MLP
             if not self.cfg.attn_only:
-                if self.cfg.model_family == "llama" or self.cfg.model_family == "mistral":
+                if self.cfg.model_family in {"llama", "mistral", "qwen2"}:
                     state_dict[f"blocks.{l}.mlp.W_up"] = (
                         state_dict[f"blocks.{l}.mlp.W_up"]
                         * state_dict[f"blocks.{l}.ln2.w"][:, None]
@@ -1015,7 +1050,7 @@ class EasyTransformer(HookedRootModule):
                 state_dict[f"blocks.{l}.attn.b_O"]
                 - state_dict[f"blocks.{l}.attn.b_O"].mean()
             )  # b_O is [d_model]
-            if self.cfg.model_family == 'llama' or self.cfg.model_family == 'mistral':
+            if self.cfg.model_family in {"llama", "mistral", "qwen2"}:
                 state_dict[f"blocks.{l}.mlp.W_down"] = state_dict[
                     f"blocks.{l}.mlp.W_down"
                 ] - state_dict[f"blocks.{l}.mlp.W_down"].mean(-1, keepdim=True)
