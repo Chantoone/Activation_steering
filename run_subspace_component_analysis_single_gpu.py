@@ -147,16 +147,42 @@ def _maybe_limit_records(records: List[Dict[str, Any]], max_examples: Optional[i
     return records[: int(max_examples)]
 
 
+def _maybe_limit_records_per_source_file(
+    records: List[Dict[str, Any]], max_examples_per_source_file: Optional[int]
+):
+    if max_examples_per_source_file is None:
+        return records
+
+    per_file_limit = int(max_examples_per_source_file)
+    grouped_counts: Dict[str, int] = {}
+    limited_records: List[Dict[str, Any]] = []
+
+    for record in records:
+        source_file = _normalize_source_file(record.get("source_file"))
+        current_count = grouped_counts.get(source_file, 0)
+        if current_count >= per_file_limit:
+            continue
+        limited_records.append(record)
+        grouped_counts[source_file] = current_count + 1
+
+    return limited_records
+
+
 def _build_dataset(
     folder_path: str,
     prompt_type: str,
     tokenizer,
     max_examples: Optional[int] = None,
+    max_examples_per_source_file: Optional[int] = None,
 ):
     records = build_prompt_records_from_folder(
         folder_path=folder_path,
         prompt_type=prompt_type,
         tokenizer=tokenizer,
+    )
+    records = _maybe_limit_records_per_source_file(
+        records,
+        max_examples_per_source_file=max_examples_per_source_file,
     )
     records = _maybe_limit_records(records, max_examples=max_examples)
     dataset = CustomTranslationDataset(records, tokenizer=tokenizer)
@@ -1197,6 +1223,7 @@ def compare_prompt_styles_with_subspace(
     prompt_orig: str = "multipivot",
     prompt_new: str = "direct",
     max_examples: Optional[int] = None,
+    max_examples_per_source_file: Optional[int] = None,
     batch_size: int = 1,
     identification_batch_size: int = 1,
     rank: int = 1,
@@ -1235,12 +1262,14 @@ def compare_prompt_styles_with_subspace(
         prompt_type=prompt_orig,
         tokenizer=tokenizer,
         max_examples=max_examples,
+        max_examples_per_source_file=max_examples_per_source_file,
     )
     dataset_new, records_new = _build_dataset(
         folder_path=folder_path,
         prompt_type=prompt_new,
         tokenizer=tokenizer,
         max_examples=max_examples,
+        max_examples_per_source_file=max_examples_per_source_file,
     )
 
     results: Dict[str, Any] = {

@@ -36,7 +36,8 @@ PROJECT_ROOT="/storage/crtai-fast/crtai5/ttran/nmt/Activation_steering"
 FOLDER_PATH="$PROJECT_ROOT/test_data"
 OUTPUT_DIR="$PROJECT_ROOT/output_100sample"
 SCRIPT_PATH="$PROJECT_ROOT/run_subspace_component_analysis_single_gpu.py"
-MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
+MODEL_NAME="meta-llama/Meta-Llama-3-8B-Instruct"
+MAX_EXAMPLES_PER_SOURCE_FILE=100
 
 mkdir -p "$OUTPUT_DIR"
 mkdir -p component_logs
@@ -66,6 +67,7 @@ echo "ID batch:    $IDENTIFICATION_BATCH_SIZE"
 echo "Rank:        $RANK"
 echo "Device:      $DEVICE"
 echo "Dtype:       $DTYPE"
+echo "Max/file:    $MAX_EXAMPLES_PER_SOURCE_FILE"
 
 # ===== Run =====
 python "$SCRIPT_PATH" compare_prompt_styles_with_subspace \
@@ -73,6 +75,7 @@ python "$SCRIPT_PATH" compare_prompt_styles_with_subspace \
   --model_name="$MODEL_NAME" \
   --prompt_orig="$PROMPT_ORIG" \
   --prompt_new="$PROMPT_NEW" \
+  --max_examples_per_source_file="$MAX_EXAMPLES_PER_SOURCE_FILE" \
   --batch_size="$BATCH_SIZE" \
   --identification_batch_size="$IDENTIFICATION_BATCH_SIZE" \
   --rank="$RANK" \

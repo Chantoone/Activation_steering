@@ -111,7 +111,7 @@ def read_parquet_folder(folder_path: str, pattern: str = "*.parquet") -> pd.Data
 
     frames = []
     for file_path in parquet_files:
-        df = pd.read_parquet(file_path)
+        df = pd.read_parquet(file_path).head(100)
         df = df.copy()
         df["source_file"] = str(file_path)
         frames.append(df)
