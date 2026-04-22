@@ -100,9 +100,9 @@ def _auto_batch_sizes(
     ):
         total_memory_gb = _get_device_total_memory_gb(device)
         if total_memory_gb >= 80:
-            return 8, 16
+            return 16, 32
         if total_memory_gb >= 64:
-            return 4, 8
+            return 8, 16
         if total_memory_gb >= 48:
             return 2, 4
         if total_memory_gb >= 24:
@@ -557,73 +557,23 @@ def _forward_logits(model, dataset):
     return logits
 
 
-def _collect_delta_rows_for_component(
-    model,
-    dataset_pos,
-    dataset_neg,
-    component: Component,
-    batch_size: int,
-) -> torch.Tensor:
-    if len(dataset_pos) != len(dataset_neg):
-        raise ValueError("Contrastive datasets must align")
+def _get_end_positions(dataset, seq_len: int, device: torch.device) -> torch.Tensor:
+    positions = dataset.word_idx["end"]
+    if not isinstance(positions, torch.Tensor):
+        positions = torch.tensor(positions)
+    positions = positions.to(device=device, dtype=torch.long)
 
-    hook_name, _ = component
-    delta_rows: List[torch.Tensor] = []
-    model_device = _get_model_device(model)
-    cache_device = "cpu"
-
-    for start in range(0, len(dataset_pos), batch_size):
-        end = start + batch_size
-        pos_batch = dataset_pos[start:end]
-        neg_batch = dataset_neg[start:end]
-
-        pos_cache: Dict[str, torch.Tensor] = {}
-        model.reset_hooks()
-        model.cache_some(
-            pos_cache,
-            lambda name: name == hook_name,
-            device=cache_device,
-            suppress_warning=True,
+    if positions.numel() != len(dataset):
+        raise ValueError(
+            f"END position count mismatch: expected {len(dataset)} values, got {positions.numel()}"
         )
-        with torch.no_grad():
-            model(pos_batch.toks.long().to(model_device))
-        model.reset_hooks()
-
-        neg_cache: Dict[str, torch.Tensor] = {}
-        model.cache_some(
-            neg_cache,
-            lambda name: name == hook_name,
-            device=cache_device,
-            suppress_warning=True,
+    if seq_len <= 0:
+        raise ValueError("Sequence length must be positive when extracting END positions")
+    if ((positions < 0) | (positions >= seq_len)).any():
+        raise ValueError(
+            f"Found END positions outside valid range [0, {seq_len - 1}]"
         )
-        with torch.no_grad():
-            model(neg_batch.toks.long().to(model_device))
-        model.reset_hooks()
-
-        pos_positions = get_generated_prediction_positions(pos_batch)
-        neg_positions = get_generated_prediction_positions(neg_batch)
-        shared_positions = _shared_generated_positions(
-            pos_positions,
-            neg_positions,
-            orig_seq_len=pos_cache[hook_name].shape[1],
-            new_seq_len=neg_cache[hook_name].shape[1],
-        )
-
-        for batch_idx, (pos_idx, neg_idx) in enumerate(shared_positions):
-            if pos_idx.numel() == 0:
-                continue
-            a_pos = _extract_component_sequence(component, pos_cache, batch_idx, pos_idx)
-            a_neg = _extract_component_sequence(component, neg_cache, batch_idx, neg_idx)
-            delta_rows.append((a_pos - a_neg).float().cpu())
-
-        del pos_cache
-        del neg_cache
-        _clear_memory()
-
-    if not delta_rows:
-        raise ValueError(f"No shared generated positions found for component {component}")
-
-    return torch.cat(delta_rows, dim=0)
+    return positions
 
 
 def _identify_subspaces_for_hook(
@@ -669,33 +619,32 @@ def _identify_subspaces_for_hook(
             model(neg_batch.toks.long().to(model_device))
         model.reset_hooks()
 
-        pos_positions = get_generated_prediction_positions(pos_batch)
-        neg_positions = get_generated_prediction_positions(neg_batch)
-        shared_positions = _shared_generated_positions(
-            pos_positions,
-            neg_positions,
-            orig_seq_len=pos_cache[hook_name].shape[1],
-            new_seq_len=neg_cache[hook_name].shape[1],
+        pos_positions = _get_end_positions(
+            pos_batch,
+            seq_len=pos_cache[hook_name].shape[1],
+            device=pos_cache[hook_name].device,
+        )
+        neg_positions = _get_end_positions(
+            neg_batch,
+            seq_len=neg_cache[hook_name].shape[1],
+            device=neg_cache[hook_name].device,
         )
 
-        for batch_idx, (pos_idx, neg_idx) in enumerate(shared_positions):
-            if pos_idx.numel() == 0:
-                continue
-            pos_idx = pos_idx.to(pos_cache[hook_name].device)
-            neg_idx = neg_idx.to(neg_cache[hook_name].device)
-            grouped_deltas.append(
-                (
-                    pos_cache[hook_name][batch_idx, pos_idx]
-                    - neg_cache[hook_name][batch_idx, neg_idx]
-                ).float().cpu()
-            )
+        batch_indices_pos = torch.arange(pos_positions.shape[0], device=pos_positions.device)
+        batch_indices_neg = torch.arange(neg_positions.shape[0], device=neg_positions.device)
+        grouped_deltas.append(
+            (
+                pos_cache[hook_name][batch_indices_pos, pos_positions]
+                - neg_cache[hook_name][batch_indices_neg, neg_positions]
+            ).float().cpu()
+        )
 
         del pos_cache
         del neg_cache
         _clear_memory()
 
     if not grouped_deltas:
-        raise ValueError(f"No shared generated positions found for hook {hook_name}")
+        raise ValueError(f"No END-position deltas found for hook {hook_name}")
 
     stacked = torch.cat(grouped_deltas, dim=0)
     result: Dict[Component, torch.Tensor] = {}
@@ -722,14 +671,16 @@ def task_steering_subspace_identification_generated_single_gpu(
     rank: int = 1,
     identification_batch_size: int = 1,
 ):
-    deltas = _collect_delta_rows_for_component(
+    hook_name, head_idx = component
+    hook_subspaces = _identify_subspaces_for_hook(
         model=model,
         dataset_pos=dataset_pos,
         dataset_neg=dataset_neg,
-        component=component,
-        batch_size=identification_batch_size,
+        hook_name=hook_name,
+        rank=rank,
+        identification_batch_size=identification_batch_size,
     )
-    return _leading_subspace_from_deltas(deltas, rank=rank)
+    return hook_subspaces[(hook_name, head_idx)]
 
 
 def _build_master_patching_caches(
