@@ -43,7 +43,7 @@ def get_hook_tuple(layer, head_idx, comp=None, input=False):
 
 
 def patch_all(z, source_act, hook):
-    z[:] = source_act  # make sure to slice! Otherwise objects get copied around
+    z[:] = source_act.to(device=z.device, dtype=z.dtype)  # keep patched activations on the active device
     return z
 
 

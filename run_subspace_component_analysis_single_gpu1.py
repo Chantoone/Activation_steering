@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import gc
-import warnings
 
 import torch
 
@@ -13,6 +12,8 @@ from translation_perplexity_utils import (
     get_generated_prediction_positions,
     get_generated_token_perplexity,
     get_generated_token_perplexity_from_logits,
+    subspace_intervene_path_patching_generated_perplexity_batch,
+    task_steering_subspace_identification_generated,
 )
 from translation_utils import patch_all
 
@@ -64,52 +65,6 @@ def _get_model_device(model) -> torch.device:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _get_device_total_memory_gb(device: str) -> float:
-    if not device.startswith("cuda") or not torch.cuda.is_available():
-        return 0.0
-    try:
-        index = torch.device(device).index
-        if index is None:
-            index = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(index)
-    except Exception:
-        return 0.0
-    return float(props.total_memory) / (1024**3)
-
-
-def _prefer_gpu_cache(device: str) -> bool:
-    return device.startswith("cuda") and _get_device_total_memory_gb(device) >= 40
-
-
-def _auto_batch_sizes(
-    device: str,
-    batch_size: int,
-    identification_batch_size: int,
-) -> Tuple[int, int]:
-    effective_batch_size = int(batch_size)
-    effective_identification_batch_size = int(identification_batch_size)
-
-    if (
-        device.startswith("cuda")
-        and effective_batch_size == 1
-        and effective_identification_batch_size == 1
-    ):
-        total_memory_gb = _get_device_total_memory_gb(device)
-        if total_memory_gb >= 40:
-            return 16, 32
-        if total_memory_gb >= 24:
-            return 8, 16
-        if total_memory_gb >= 16:
-            return 4, 8
-
-    return effective_batch_size, effective_identification_batch_size
-
-
-def _is_oom_error(exc: RuntimeError) -> bool:
-    message = str(exc).lower()
-    return "out of memory" in message or "cuda error: out of memory" in message
 
 
 def _load_easy_transformer(
@@ -480,69 +435,6 @@ def _project_patch(
     return patched.to(device=a_plus.device, dtype=a_plus.dtype)
 
 
-def _leading_subspace_from_deltas(
-    deltas: torch.Tensor,
-    rank: int,
-) -> torch.Tensor:
-    compute_dtype = deltas.dtype
-    if compute_dtype in {torch.float16, torch.bfloat16}:
-        compute_dtype = torch.float32
-
-    Mc = deltas.T.to(dtype=compute_dtype)
-    if not torch.isfinite(Mc).all():
-        invalid_count = (~torch.isfinite(Mc)).sum().item()
-        raise ValueError(
-            f"Non-finite values detected in deltas before SVD: {invalid_count} entries"
-        )
-
-    ones = torch.ones(Mc.shape[1], device=Mc.device, dtype=Mc.dtype)
-    Sc_prime = (Mc @ ones) / Mc.shape[1]
-    residual = Mc - Sc_prime.unsqueeze(1) @ ones.unsqueeze(0)
-
-    if not torch.isfinite(residual).all():
-        invalid_count = (~torch.isfinite(residual)).sum().item()
-        raise ValueError(
-            f"Non-finite values detected in centered deltas before SVD: {invalid_count} entries"
-        )
-
-    if residual.numel() == 0:
-        raise ValueError("Cannot identify a subspace from an empty delta matrix")
-
-    residual_norm = residual.norm()
-    if not torch.isfinite(residual_norm) or residual_norm.item() <= 1e-12:
-        leading = Sc_prime
-        leading_norm = leading.norm()
-        if not torch.isfinite(leading_norm) or leading_norm.item() <= 1e-12:
-            leading = torch.zeros(Mc.shape[0], device=Mc.device, dtype=Mc.dtype)
-            leading[0] = 1.0
-        else:
-            leading = leading / leading_norm
-        return leading.unsqueeze(1)
-
-    try:
-        U, S, Vh = torch.linalg.svd(residual, full_matrices=False)
-    except torch._C._LinAlgError as exc:
-        if residual.device.type != "cuda":
-            raise
-        warnings.warn(
-            "CUDA SVD failed during subspace identification; retrying on CPU."
-        )
-        residual_cpu = residual.cpu()
-        U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(residual_cpu, full_matrices=False)
-        U = U_cpu.to(device=residual.device)
-        S = S_cpu.to(device=residual.device)
-        Vh = Vh_cpu.to(device=residual.device)
-
-    r = min(rank, U.shape[1])
-    U_r = U[:, :r]
-    S_r = S[:r]
-    Vh_r = Vh[:r]
-    Mc_prime = Sc_prime.unsqueeze(1) + (U_r * S_r) @ Vh_r
-    leading = (Mc_prime @ ones) / Mc_prime.shape[1]
-    leading = leading / (leading.norm() + 1e-12)
-    return leading.unsqueeze(1)
-
-
 def _forward_logits(model, dataset):
     model_device = _get_model_device(model)
     toks = dataset.toks.long().to(model_device)
@@ -564,7 +456,6 @@ def _collect_delta_rows_for_component(
     hook_name, _ = component
     delta_rows: List[torch.Tensor] = []
     model_device = _get_model_device(model)
-    cache_device = str(model_device) if model_device.type == "cuda" else "cpu"
 
     for start in range(0, len(dataset_pos), batch_size):
         end = start + batch_size
@@ -576,7 +467,7 @@ def _collect_delta_rows_for_component(
         model.cache_some(
             pos_cache,
             lambda name: name == hook_name,
-            device=cache_device,
+            device="cpu",
             suppress_warning=True,
         )
         with torch.no_grad():
@@ -587,7 +478,7 @@ def _collect_delta_rows_for_component(
         model.cache_some(
             neg_cache,
             lambda name: name == hook_name,
-            device=cache_device,
+            device="cpu",
             suppress_warning=True,
         )
         with torch.no_grad():
@@ -620,96 +511,6 @@ def _collect_delta_rows_for_component(
     return torch.cat(delta_rows, dim=0)
 
 
-def _identify_subspaces_for_hook(
-    model,
-    dataset_pos,
-    dataset_neg,
-    hook_name: str,
-    rank: int,
-    identification_batch_size: int,
-) -> Dict[Component, torch.Tensor]:
-    if len(dataset_pos) != len(dataset_neg):
-        raise ValueError("Contrastive datasets must align")
-
-    model_device = _get_model_device(model)
-    cache_device = str(model_device) if _prefer_gpu_cache(str(model_device)) else "cpu"
-    grouped_deltas: List[torch.Tensor] = []
-
-    for start in range(0, len(dataset_pos), identification_batch_size):
-        end = start + identification_batch_size
-        pos_batch = dataset_pos[start:end]
-        neg_batch = dataset_neg[start:end]
-
-        pos_cache: Dict[str, torch.Tensor] = {}
-        model.reset_hooks()
-        model.cache_some(
-            pos_cache,
-            lambda name: name == hook_name,
-            device=cache_device,
-            suppress_warning=True,
-        )
-        with torch.no_grad():
-            model(pos_batch.toks.long().to(model_device))
-        model.reset_hooks()
-
-        neg_cache: Dict[str, torch.Tensor] = {}
-        model.cache_some(
-            neg_cache,
-            lambda name: name == hook_name,
-            device=cache_device,
-            suppress_warning=True,
-        )
-        with torch.no_grad():
-            model(neg_batch.toks.long().to(model_device))
-        model.reset_hooks()
-
-        pos_positions = get_generated_prediction_positions(pos_batch)
-        neg_positions = get_generated_prediction_positions(neg_batch)
-        shared_positions = _shared_generated_positions(
-            pos_positions,
-            neg_positions,
-            orig_seq_len=pos_cache[hook_name].shape[1],
-            new_seq_len=neg_cache[hook_name].shape[1],
-        )
-
-        for batch_idx, (pos_idx, neg_idx) in enumerate(shared_positions):
-            if pos_idx.numel() == 0:
-                continue
-            pos_idx = pos_idx.to(pos_cache[hook_name].device)
-            neg_idx = neg_idx.to(neg_cache[hook_name].device)
-            grouped_deltas.append(
-                (
-                    pos_cache[hook_name][batch_idx, pos_idx]
-                    - neg_cache[hook_name][batch_idx, neg_idx]
-                ).float()
-            )
-
-        del pos_cache
-        del neg_cache
-        _clear_memory()
-
-    if not grouped_deltas:
-        raise ValueError(f"No shared generated positions found for hook {hook_name}")
-
-    stacked = torch.cat(grouped_deltas, dim=0)
-    result: Dict[Component, torch.Tensor] = {}
-    layer = int(hook_name.split(".")[1])
-
-    if stacked.dim() == 2:
-        result[(hook_name, None)] = _leading_subspace_from_deltas(stacked, rank=rank)
-        return result
-
-    if stacked.dim() != 3:
-        raise ValueError(f"Unsupported activation shape for hook {hook_name}: {stacked.shape}")
-
-    for head_idx in range(stacked.shape[1]):
-        result[(hook_name, head_idx)] = _leading_subspace_from_deltas(
-            stacked[:, head_idx, :],
-            rank=rank,
-        )
-    return result
-
-
 def task_steering_subspace_identification_generated_single_gpu(
     model,
     dataset_pos,
@@ -725,62 +526,19 @@ def task_steering_subspace_identification_generated_single_gpu(
         component=component,
         batch_size=identification_batch_size,
     )
-    return _leading_subspace_from_deltas(deltas, rank=rank)
-
-
-def _build_master_patching_caches(
-    model,
-    dataset_orig,
-    dataset_new,
-    freeze_mlps: bool,
-):
-    model_device = _get_model_device(model)
-    cache_device = str(model_device) if _prefer_gpu_cache(str(model_device)) else "cpu"
-
-    sender_hook_names = {
-        f"blocks.{layer}.hook_mlp_out"
-        for layer in range(model.cfg.n_layers)
-    }
-    sender_hook_names.update(
-        f"blocks.{layer}.attn.hook_z"
-        for layer in range(model.cfg.n_layers)
-    )
-
-    target_hook_names = set(sender_hook_names)
-    for layer in range(model.cfg.n_layers):
-        for hook_template in [
-            "blocks.{}.attn.hook_q",
-            "blocks.{}.attn.hook_k",
-            "blocks.{}.attn.hook_v",
-        ]:
-            target_hook_names.add(hook_template.format(layer))
-        if freeze_mlps:
-            target_hook_names.add(f"blocks.{layer}.hook_mlp_out")
-
-    sender_cache: Dict[str, torch.Tensor] = {}
-    model.reset_hooks()
-    model.cache_some(
-        sender_cache,
-        lambda name: name in sender_hook_names,
-        device=cache_device,
-        suppress_warning=True,
-    )
-    with torch.no_grad():
-        model(dataset_new.toks.long().to(model_device))
-    model.reset_hooks()
-
-    target_cache: Dict[str, torch.Tensor] = {}
-    model.cache_some(
-        target_cache,
-        lambda name: name in target_hook_names,
-        device=cache_device,
-        suppress_warning=True,
-    )
-    with torch.no_grad():
-        model(dataset_orig.toks.long().to(model_device))
-    model.reset_hooks()
-
-    return sender_cache, target_cache
+    Mc = deltas.T
+    ones = torch.ones(Mc.shape[1], device=Mc.device, dtype=Mc.dtype)
+    Sc_prime = (Mc @ ones) / Mc.shape[1]
+    residual = Mc - Sc_prime.unsqueeze(1) @ ones.unsqueeze(0)
+    U, S, Vh = torch.linalg.svd(residual, full_matrices=False)
+    r = min(rank, U.shape[1])
+    U_r = U[:, :r]
+    S_r = S[:r]
+    Vh_r = Vh[:r]
+    Mc_prime = Sc_prime.unsqueeze(1) + (U_r * S_r) @ Vh_r
+    leading = (Mc_prime @ ones) / Mc_prime.shape[1]
+    leading = leading / (leading.norm() + 1e-12)
+    return leading.unsqueeze(1).cpu()
 
 
 def _subspace_delta_for_component_batch(
@@ -794,59 +552,47 @@ def _subspace_delta_for_component_batch(
     freeze_mlps: bool,
     have_internal_interactions: bool,
     epsilon: float = 1e-8,
-    sender_cache: Optional[Dict[str, torch.Tensor]] = None,
-    target_cache: Optional[Dict[str, torch.Tensor]] = None,
-    orig_positions: Optional[Sequence[torch.Tensor]] = None,
-    new_positions: Optional[Sequence[torch.Tensor]] = None,
 ):
     hook_name, _ = component
     receiver_hook_names = [x[0] for x in receiver_hooks]
     model_device = _get_model_device(model)
 
-    if orig_positions is None:
-        orig_positions = get_generated_prediction_positions(dataset_orig)
-    if new_positions is None:
-        new_positions = get_generated_prediction_positions(dataset_new)
+    orig_positions = get_generated_prediction_positions(dataset_orig)
+    new_positions = get_generated_prediction_positions(dataset_new)
 
-    owns_sender_cache = sender_cache is None
-    owns_target_cache = target_cache is None
+    sender_cache: Dict[str, torch.Tensor] = {}
+    model.reset_hooks()
+    model.cache_some(
+        sender_cache,
+        lambda name: name == hook_name,
+        device="cpu",
+        suppress_warning=True,
+    )
+    with torch.no_grad():
+        model(dataset_new.toks.long().to(model_device))
+    model.reset_hooks()
 
-    if sender_cache is None:
-        sender_cache = {}
-        cache_device = "cpu"
-        model.reset_hooks()
-        model.cache_some(
-            sender_cache,
-            lambda name: name == hook_name,
-            device=cache_device,
-            suppress_warning=True,
-        )
-        with torch.no_grad():
-            model(dataset_new.toks.long().to(model_device))
-        model.reset_hooks()
+    target_hook_names = {hook_name}
+    for layer in range(model.cfg.n_layers):
+        for hook_template in [
+            "blocks.{}.attn.hook_q",
+            "blocks.{}.attn.hook_k",
+            "blocks.{}.attn.hook_v",
+        ]:
+            target_hook_names.add(hook_template.format(layer))
+        if freeze_mlps:
+            target_hook_names.add(f"blocks.{layer}.hook_mlp_out")
 
-    if target_cache is None:
-        target_hook_names = {hook_name}
-        for layer in range(model.cfg.n_layers):
-            for hook_template in [
-                "blocks.{}.attn.hook_q",
-                "blocks.{}.attn.hook_k",
-                "blocks.{}.attn.hook_v",
-            ]:
-                target_hook_names.add(hook_template.format(layer))
-            if freeze_mlps:
-                target_hook_names.add(f"blocks.{layer}.hook_mlp_out")
-
-        target_cache = {}
-        model.cache_some(
-            target_cache,
-            lambda name: name in target_hook_names,
-            device="cpu",
-            suppress_warning=True,
-        )
-        with torch.no_grad():
-            model(dataset_orig.toks.long().to(model_device))
-        model.reset_hooks()
+    target_cache: Dict[str, torch.Tensor] = {}
+    model.cache_some(
+        target_cache,
+        lambda name: name in target_hook_names,
+        device="cpu",
+        suppress_warning=True,
+    )
+    with torch.no_grad():
+        model(dataset_orig.toks.long().to(model_device))
+    model.reset_hooks()
 
     shared_positions = _shared_generated_positions(
         orig_positions,
@@ -962,14 +708,11 @@ def _subspace_delta_for_component_batch(
     ) / (y_orig + epsilon)
     model.reset_hooks()
 
-    if owns_sender_cache:
-        del sender_cache
-    if owns_target_cache:
-        del target_cache
+    del sender_cache
+    del target_cache
     del receiver_cache
     del logits_new
-    if owns_sender_cache or owns_target_cache:
-        _clear_memory()
+    _clear_memory()
     return float(delta.mean().detach().cpu())
 
 
@@ -985,97 +728,44 @@ def _scan_components_with_subspace(
     have_internal_interactions: bool,
 ):
     components = _all_components(model)
-    model_device = _get_model_device(model)
-    baseline_values = get_generated_token_perplexity(
-        model,
-        dataset_orig,
-        all=True,
-        batch_size=batch_size,
+    baseline_ppl = float(
+        get_generated_token_perplexity(
+            model,
+            dataset_orig,
+            batch_size=batch_size,
+        ).item()
     )
-    baseline_ppl = float(baseline_values.mean().item())
 
     subspace_dict: Dict[Component, torch.Tensor] = {}
-    hook_names = sorted({component[0] for component in components})
-    for hook_name in hook_names:
-        hook_subspaces = _identify_subspaces_for_hook(
-            model=model,
-            dataset_pos=dataset_orig,
-            dataset_neg=dataset_new,
-            hook_name=hook_name,
-            rank=rank,
-            identification_batch_size=identification_batch_size,
-        )
-        for component, subspace in hook_subspaces.items():
-            subspace_dict[component] = subspace.to(model_device)
-        _clear_memory()
-
-    totals: Dict[Component, float] = {component: 0.0 for component in components}
-    counts = 0
-    use_master_caches = _prefer_gpu_cache(str(model_device))
-
-    for start in range(0, len(dataset_orig), batch_size):
-        end = start + batch_size
-        orig_batch = dataset_orig[start:end]
-        new_batch = dataset_new[start:end]
-
-        logits_orig = _forward_logits(model, orig_batch)
-        y_orig = get_generated_token_perplexity_from_logits(
-            logits_orig,
-            orig_batch,
-        ).detach()
-        del logits_orig
-
-        orig_positions = get_generated_prediction_positions(orig_batch)
-        new_positions = get_generated_prediction_positions(new_batch)
-
-        sender_cache = None
-        target_cache = None
-        if use_master_caches:
-            try:
-                sender_cache, target_cache = _build_master_patching_caches(
-                    model=model,
-                    dataset_orig=orig_batch,
-                    dataset_new=new_batch,
-                    freeze_mlps=freeze_mlps,
-                )
-            except RuntimeError as exc:
-                if not _is_oom_error(exc):
-                    raise
-                sender_cache = None
-                target_cache = None
-                use_master_caches = False
-                _clear_memory()
-
-        for component in components:
-            delta = _subspace_delta_for_component_batch(
+    for component in components:
+        # Follow the same identification routine as the reference implementation:
+        # build the steering subspace from contrastive activations, then score
+        # components with path patching. Output scoring remains perplexity-based.
+        subspace_dict[component] = (
+            task_steering_subspace_identification_generated(
                 model=model,
-                dataset_orig=orig_batch,
-                dataset_new=new_batch,
+                dataset_pos=dataset_orig,
+                dataset_neg=dataset_new,
                 component=component,
-                subspace=subspace_dict[component],
-                y_orig=y_orig,
-                receiver_hooks=receiver_hooks,
-                freeze_mlps=freeze_mlps,
-                have_internal_interactions=have_internal_interactions,
-                sender_cache=sender_cache,
-                target_cache=target_cache,
-                orig_positions=orig_positions,
-                new_positions=new_positions,
+                rank=rank,
             )
-            totals[component] += float(delta) * len(orig_batch)
-
-        if sender_cache is not None:
-            del sender_cache
-        if target_cache is not None:
-            del target_cache
-        counts += len(orig_batch)
-        del y_orig
+            .detach()
+            .cpu()
+        )
         _clear_memory()
 
-    deltas = {
-        component: totals[component] / max(counts, 1)
-        for component in components
-    }
+    deltas = subspace_intervene_path_patching_generated_perplexity_batch(
+        model=model,
+        dataset_orig=dataset_orig,
+        dataset_new=dataset_new,
+        components=components,
+        subspace_dict=subspace_dict,
+        receiver_hooks=receiver_hooks,
+        freeze_mlps=freeze_mlps,
+        have_internal_interactions=have_internal_interactions,
+        batch_size=batch_size,
+        metric_fn=get_generated_token_perplexity_from_logits,
+    )
 
     delta_pct = {
         component: 100.0 * float(delta)
@@ -1152,6 +842,16 @@ def _analyze_dataset_pair(
     _save_results(
         output_dir=output_dir_path,
         prefix=f"subspace_{prompt_new}_into_{prompt_orig}{output_prefix_suffix}",
+        baseline_ppl=baseline_ppl,
+        head_results=head_results,
+        mlp_results=mlp_results,
+        rank=rank,
+        top_k=top_k,
+        dtype=dtype,
+    )
+    _save_results(
+        output_dir=output_dir_path,
+        prefix=f"{prompt_new}_to_{prompt_orig}{output_prefix_suffix}",
         baseline_ppl=baseline_ppl,
         head_results=head_results,
         mlp_results=mlp_results,
@@ -1247,8 +947,6 @@ def compare_prompt_styles_with_subspace(
     dtype: str = "auto",
     freeze_mlps: bool = False,
     have_internal_interactions: bool = False,
-    per_source_file: bool = True,
-    skip_per_source_file: bool = False,
 ):
     """
     Single-GPU subspace component analysis aligned with the reference path-patching
@@ -1266,11 +964,6 @@ def compare_prompt_styles_with_subspace(
         model_name=model_name,
         device=device,
         dtype=dtype,
-    )
-    batch_size, identification_batch_size = _auto_batch_sizes(
-        device=resolved_device,
-        batch_size=batch_size,
-        identification_batch_size=identification_batch_size,
     )
 
     dataset_orig, records_orig = _build_dataset(
@@ -1298,9 +991,6 @@ def compare_prompt_styles_with_subspace(
         "subspace_rank": rank,
         "implementation": "single_gpu_memory_optimized",
         "attention_component": "hook_z",
-        "batch_size": batch_size,
-        "identification_batch_size": identification_batch_size,
-        "per_source_file_enabled": bool(per_source_file) and not bool(skip_per_source_file),
     }
 
     overall_results = _analyze_dataset_pair(
@@ -1320,25 +1010,22 @@ def compare_prompt_styles_with_subspace(
         freeze_mlps=freeze_mlps,
         have_internal_interactions=have_internal_interactions,
     )
-    should_run_per_source_file = bool(per_source_file) and not bool(skip_per_source_file)
-    per_source_file_results: Dict[str, Any] = {}
-    if should_run_per_source_file:
-        per_source_file_results = _build_source_file_results(
-            model=model,
-            tokenizer=tokenizer,
-            records_orig=records_orig,
-            records_new=records_new,
-            prompt_orig=prompt_orig,
-            prompt_new=prompt_new,
-            batch_size=batch_size,
-            identification_batch_size=identification_batch_size,
-            rank=rank,
-            top_k=top_k,
-            dtype=resolved_dtype,
-            output_dir_path=output_dir_path,
-            freeze_mlps=freeze_mlps,
-            have_internal_interactions=have_internal_interactions,
-        )
+    per_source_file_results = _build_source_file_results(
+        model=model,
+        tokenizer=tokenizer,
+        records_orig=records_orig,
+        records_new=records_new,
+        prompt_orig=prompt_orig,
+        prompt_new=prompt_new,
+        batch_size=batch_size,
+        identification_batch_size=identification_batch_size,
+        rank=rank,
+        top_k=top_k,
+        dtype=resolved_dtype,
+        output_dir_path=output_dir_path,
+        freeze_mlps=freeze_mlps,
+        have_internal_interactions=have_internal_interactions,
+    )
 
     if output_dir_path is not None:
         _write_overall_summary(
